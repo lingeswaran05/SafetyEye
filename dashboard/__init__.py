@@ -1,0 +1,1 @@
+"""SafetyEye Dashboard Package."""

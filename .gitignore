@@ -1,0 +1,29 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual Environments
+.venv/
+venv/
+env/
+ENV/
+
+# System and IDE files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
+
+# Dynamic outputs and generated snapshots (preserve directories via .gitkeep)
+dashboard/static/video/*.jpg
+dashboard/static/video/*.png
+dashboard/static/video/*.mp4
+violations_evidence/
+runs/
+*.log
