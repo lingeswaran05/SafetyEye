@@ -1,0 +1,17 @@
+[Unit]
+Description=SafetyEye PPE Workplace Monitoring Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/SafetyEye
+EnvironmentFile=/opt/SafetyEye/.env
+ExecStart=/opt/SafetyEye/.venv/bin/streamlit run app.py --server.port 8501 --server.address 0.0.0.0 --server.enableCORS false --server.enableXsrfProtection false
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
