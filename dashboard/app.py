@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 import time
 from datetime import datetime
@@ -20,6 +21,7 @@ from dashboard.modules.compliance_stats import render_compliance_dashboard
 MODEL_PATH = PROJECT_ROOT / "model" / "best.pt"
 LOG_PATH = PROJECT_ROOT / "dashboard" / "static" / "logs" / "violations.jsonl"
 VIDEO_DIR = PROJECT_ROOT / "dashboard" / "static" / "video"
+DEMO_VIDEO_PATH = VIDEO_DIR / "demo_sample.mp4"
 
 LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 VIDEO_DIR.mkdir(parents=True, exist_ok=True)
@@ -57,6 +59,20 @@ def open_video_capture(source):
     return None
 
 
+def resolve_image_path(raw_path: str) -> Path | None:
+    """Cross-platform image resolver to locate snapshots saved on different operating systems."""
+    if not raw_path:
+        return None
+    p = Path(raw_path)
+    if p.exists():
+        return p
+    # Try finding in local VIDEO_DIR by file name (e.g. if logged on Windows and viewed on Linux)
+    candidate = VIDEO_DIR / p.name
+    if candidate.exists():
+        return candidate
+    return None
+
+
 def main():
     st.set_page_config(
         page_title="SafetyEye - PPE Workplace Monitor",
@@ -78,16 +94,18 @@ def main():
 
         # Sidebar Controls
         st.sidebar.subheader("Stream Configuration")
-        source_mode = st.sidebar.radio("Input Source", ["Webcam", "Video File Path", "Upload Video File"])
+        source_mode = st.sidebar.radio(
+            "Input Source",
+            ["🎬 Demo Sample Video (Cloud / Quick Test)", "Upload Video File", "Video File Path / RTSP", "Webcam (Local)"],
+        )
 
         video_source = 0
         temp_video_path = None
 
-        if source_mode == "Webcam":
-            cam_idx = st.sidebar.number_input("Camera Index", min_value=0, max_value=10, value=0, step=1)
-            video_source = int(cam_idx)
-        elif source_mode == "Video File Path":
-            video_source = st.sidebar.text_input("Enter Video File / RTSP URL", "data/test_video.mp4")
+        if source_mode == "🎬 Demo Sample Video (Cloud / Quick Test)":
+            if not DEMO_VIDEO_PATH.exists():
+                st.sidebar.info("Demo video generating...")
+            video_source = str(DEMO_VIDEO_PATH)
         elif source_mode == "Upload Video File":
             uploaded_file = st.sidebar.file_uploader("Upload MP4 / AVI / MOV", type=["mp4", "avi", "mov"])
             if uploaded_file is not None:
@@ -95,6 +113,14 @@ def main():
                 with open(temp_video_path, "wb") as f:
                     f.write(uploaded_file.getbuffer())
                 video_source = str(temp_video_path)
+            else:
+                video_source = None
+        elif source_mode == "Video File Path / RTSP":
+            video_source = st.sidebar.text_input("Enter Video File / RTSP Stream URL", "dashboard/static/video/demo_sample.mp4")
+        elif source_mode == "Webcam (Local)":
+            cam_idx = st.sidebar.number_input("Camera Index", min_value=0, max_value=10, value=0, step=1)
+            video_source = int(cam_idx)
+            st.sidebar.caption("⚠️ Physical webcams are only available when running on local machine, not remote cloud servers.")
 
         conf_thresh = st.sidebar.slider("Detection Confidence Threshold", 0.10, 0.95, 0.45, 0.05)
         log_cooldown = st.sidebar.slider("Violation Log Cooldown (seconds)", 1, 60, 5)
@@ -109,7 +135,10 @@ def main():
             st.session_state.last_log_time = 0.0
 
         if start_button:
-            st.session_state.running = True
+            if video_source is None:
+                st.sidebar.error("Please upload a video file first.")
+            else:
+                st.session_state.running = True
         if stop_button:
             st.session_state.running = False
 
@@ -126,7 +155,7 @@ def main():
             active_violations_box = st.empty()
             last_alert_box = st.empty()
 
-        if st.session_state.running:
+        if st.session_state.running and video_source is not None:
             if not MODEL_PATH.exists():
                 st.error(f"❌ Model file not found at '{MODEL_PATH}'. Please ensure 'model/best.pt' exists.")
                 st.session_state.running = False
@@ -136,7 +165,10 @@ def main():
                 cap = open_video_capture(video_source)
 
                 if cap is None or not cap.isOpened():
-                    st.error("❌ Failed to open video source. Please check camera access or file path.")
+                    if isinstance(video_source, int):
+                        st.error("❌ Failed to open video source. Physical webcam index 0 is not available on cloud servers. Please choose 'Demo Sample Video' or 'Upload Video File'.")
+                    else:
+                        st.error(f"❌ Failed to open video file/stream at '{video_source}'.")
                     st.session_state.running = False
                 else:
                     try:
@@ -175,7 +207,7 @@ def main():
                                         record = {
                                             "id": f"{ts_str}_{v.replace(' ', '_')}",
                                             "timestamp": ts_str,
-                                            "frame_image": str(img_path),
+                                            "frame_image": img_filename,
                                             "violation_type": v,
                                             "confidence": max_conf,
                                             "worker_id": "Worker-01",
@@ -237,9 +269,10 @@ def main():
 
             col_img, col_info = st.columns([2, 1])
             with col_img:
-                img_path = record.get("frame_image")
-                if img_path and Path(img_path).exists():
-                    img = cv2.imread(img_path)
+                raw_img = record.get("frame_image")
+                img_path = resolve_image_path(raw_img)
+                if img_path and img_path.exists():
+                    img = cv2.imread(str(img_path))
                     if img is not None:
                         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
                         st.image(img_rgb, caption=f"Captured Snapshot: {record.get('violation_type')}", use_container_width=True)

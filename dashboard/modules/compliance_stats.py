@@ -23,8 +23,12 @@ def render_compliance_dashboard():
     
     # Calculate monitored duration if timestamps are present
     if "timestamp" in df.columns and total_records > 1:
-        time_span_seconds = (df["timestamp"].max() - df["timestamp"].min()).total_seconds()
-        monitored_hours = max(time_span_seconds / 3600.0, 0.01)
+        valid_ts = df["timestamp"].dropna()
+        if len(valid_ts) > 1:
+            time_span_seconds = (valid_ts.max() - valid_ts.min()).total_seconds()
+            monitored_hours = max(time_span_seconds / 3600.0, 0.01)
+        else:
+            monitored_hours = 0.0
     else:
         monitored_hours = 0.0
 
@@ -58,26 +62,29 @@ def render_compliance_dashboard():
             fig_bar.update_layout(showlegend=False)
             st.plotly_chart(fig_bar, use_container_width=True)
 
-    # 2. Hourly Timeline Trend
+    # 2. Hourly Timeline Trend (Version-agnostic across all Pandas versions)
     with col_chart2:
         st.subheader("Hourly Violation Activity")
         if "timestamp" in df.columns:
-            df_hourly = (
-                df.groupby(df["timestamp"].dt.to_period("H"))
-                .size()
-                .reset_index(name="Alerts Count")
-            )
-            df_hourly["Hour"] = df_hourly["timestamp"].astype(str)
+            df_valid = df.dropna(subset=["timestamp"]).copy()
+            if not df_valid.empty:
+                df_valid["Hour"] = df_valid["timestamp"].dt.strftime("%Y-%m-%d %H:00")
+                df_hourly = (
+                    df_valid.groupby("Hour")
+                    .size()
+                    .reset_index(name="Alerts Count")
+                    .sort_values(by="Hour")
+                )
 
-            fig_line = px.line(
-                df_hourly,
-                x="Hour",
-                y="Alerts Count",
-                markers=True,
-                template=THEME,
-                title="Hourly Violation Alerts Timeline",
-            )
-            st.plotly_chart(fig_line, use_container_width=True)
+                fig_line = px.line(
+                    df_hourly,
+                    x="Hour",
+                    y="Alerts Count",
+                    markers=True,
+                    template=THEME,
+                    title="Hourly Violation Alerts Timeline",
+                )
+                st.plotly_chart(fig_line, use_container_width=True)
 
     # Raw Data Explorer & Export
     st.markdown("---")
