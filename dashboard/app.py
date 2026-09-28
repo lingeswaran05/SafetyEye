@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 
 import cv2
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -110,147 +111,220 @@ def main():
             "Input Source",
             [
                 "Upload Video File",
+                "📸 Upload Image / Photo",
                 "Demo Video Stream",
                 "Video File Path / RTSP",
-                "Webcam",
             ],
         )
 
-        video_source = 0
-        temp_video_path = None
-
-        if source_mode == "Upload Video File":
-            uploaded_file = st.sidebar.file_uploader("Upload MP4 / AVI / MOV", type=["mp4", "avi", "mov"])
-            if uploaded_file is not None:
-                temp_video_path = VIDEO_DIR / f"temp_{uploaded_file.name}"
-                with open(temp_video_path, "wb") as f:
-                    f.write(uploaded_file.getbuffer())
-                video_source = str(temp_video_path)
-            else:
-                video_source = None
-        elif source_mode == "Demo Video Stream":
-            video_source = str(DEMO_VIDEO_PATH)
-        elif source_mode == "Video File Path / RTSP":
-            video_source = st.sidebar.text_input("Enter Video File / RTSP Stream URL", "dashboard/static/video/demo_sample.mp4")
-        elif source_mode == "Webcam":
-            cam_idx = st.sidebar.number_input("Camera Index", min_value=0, max_value=10, value=0, step=1)
-            video_source = int(cam_idx)
-
         conf_thresh = st.sidebar.slider("Detection Confidence Threshold", 0.10, 0.95, 0.45, 0.05)
         log_cooldown = st.sidebar.slider("Violation Log Cooldown (seconds)", 1, 60, 5)
-
-        col_btn1, col_btn2 = st.sidebar.columns(2)
-        start_button = col_btn1.button("▶️ Start Stream", use_container_width=True)
-        stop_button = col_btn2.button("⏹️ Stop Stream", use_container_width=True)
 
         if "running" not in st.session_state:
             st.session_state.running = False
         if "last_log_time" not in st.session_state:
             st.session_state.last_log_time = 0.0
 
-        if start_button:
-            if video_source is None:
-                st.sidebar.error("Please upload a video file first.")
-            else:
-                st.session_state.running = True
-        if stop_button:
-            st.session_state.running = False
+        # Mode 1: Static Image / Photo Inspection
+        if source_mode == "📸 Upload Image / Photo":
+            uploaded_img = st.sidebar.file_uploader("Upload Image (JPG, PNG, JPEG)", type=["jpg", "jpeg", "png", "webp"])
 
-        # Layout Columns
-        col1, col2 = st.columns([2.2, 1.0])
+            col1, col2 = st.columns([2.2, 1.0])
 
-        with col1:
-            st.subheader("Live Detection Stream")
-            frame_slot = st.empty()
+            with col1:
+                st.subheader("Image Detection Result")
+                frame_slot = st.empty()
 
-        with col2:
-            st.subheader("Live Status & KPIs")
-            fps_metric = st.metric("Processing FPS", "0.0")
-            active_violations_box = st.empty()
-            last_alert_box = st.empty()
+            with col2:
+                st.subheader("Inspection KPIs")
+                fps_metric = st.metric("Inference Time", "0.0 ms")
+                active_violations_box = st.empty()
+                last_alert_box = st.empty()
 
-        if st.session_state.running and video_source is not None:
-            if not MODEL_PATH.exists():
-                st.error(f"❌ Model file not found at '{MODEL_PATH}'. Please ensure 'model/best.pt' exists.")
-                st.session_state.running = False
-            else:
+            if uploaded_img is not None:
                 detector = get_detector(str(MODEL_PATH))
                 detector.conf_thresh = conf_thresh
-                cap = open_video_capture(video_source)
 
-                if cap is None or not cap.isOpened():
-                    if isinstance(video_source, int):
-                        st.error("❌ Failed to open video source. Physical camera #0 is only accessible when running locally. On cloud deployment, please choose 'Upload Video File' or 'Demo Video Stream'!")
+                file_bytes = np.frombuffer(uploaded_img.read(), np.uint8)
+                cv2_img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+
+                if cv2_img is not None:
+                    t0 = time.time()
+                    annotated, detections, fps = detector.run_on_frame(cv2_img)
+                    latency_ms = (time.time() - t0) * 1000.0
+                    fps_metric.metric("Inference Time", f"{latency_ms:.1f} ms")
+
+                    # Display image
+                    annotated_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
+                    frame_slot.image(annotated_rgb, caption=f"Analyzed Image: {uploaded_img.name}", channels="RGB", use_container_width=True)
+
+                    # Evaluate Safety Rules
+                    violations = apply_rules(detections)
+                    ts_str = datetime.now().isoformat()
+
+                    if violations:
+                        active_violations_box.error(f"⚠️ Active Violations: {', '.join(violations)}")
+
+                        img_filename = f"violation_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uploaded_img.name}"
+                        img_path = VIDEO_DIR / img_filename
+                        cv2.imwrite(str(img_path), annotated)
+
+                        max_conf = max((d["confidence"] for d in detections), default=0.0)
+
+                        # Log to database
+                        for v in violations:
+                            record = {
+                                "id": f"{ts_str}_{v.replace(' ', '_')}",
+                                "timestamp": ts_str,
+                                "frame_image": img_filename,
+                                "violation_type": v,
+                                "confidence": max_conf,
+                                "worker_id": "Worker-01",
+                                "source": f"Image: {uploaded_img.name}",
+                            }
+                            with open(LOG_PATH, "a", encoding="utf-8") as lf:
+                                lf.write(json.dumps(record) + "\n")
+
+                        # Trigger email alert
+                        consolidated_alert = {
+                            "id": ts_str,
+                            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "frame_image": str(img_path),
+                            "violations": violations,
+                            "confidence": max_conf,
+                            "worker_id": "Worker-01",
+                            "source": f"Image: {uploaded_img.name}",
+                        }
+                        trigger_alert_async(consolidated_alert)
+                        last_alert_box.warning(f"🚨 Logged Alert: {', '.join(violations)} at {datetime.now().strftime('%H:%M:%S')}")
                     else:
-                        st.error(f"❌ Failed to open video source '{video_source}'. Please verify file format or stream URL.")
+                        active_violations_box.success("✅ All Workers Compliant")
+            else:
+                frame_slot.info("💡 Please upload an image file from the sidebar to inspect PPE compliance.")
+
+        # Mode 2: Video Stream Processing
+        else:
+            video_source = 0
+            temp_video_path = None
+
+            if source_mode == "Upload Video File":
+                uploaded_file = st.sidebar.file_uploader("Upload MP4 / AVI / MOV", type=["mp4", "avi", "mov"])
+                if uploaded_file is not None:
+                    temp_video_path = VIDEO_DIR / f"temp_{uploaded_file.name}"
+                    with open(temp_video_path, "wb") as f:
+                        f.write(uploaded_file.getbuffer())
+                    video_source = str(temp_video_path)
+                else:
+                    video_source = None
+            elif source_mode == "Demo Video Stream":
+                video_source = str(DEMO_VIDEO_PATH)
+            elif source_mode == "Video File Path / RTSP":
+                video_source = st.sidebar.text_input("Enter Video File / RTSP Stream URL", "dashboard/static/video/demo_sample.mp4")
+
+            col_btn1, col_btn2 = st.sidebar.columns(2)
+            start_button = col_btn1.button("▶️ Start Stream", use_container_width=True)
+            stop_button = col_btn2.button("⏹️ Stop Stream", use_container_width=True)
+
+            if start_button:
+                if video_source is None:
+                    st.sidebar.error("Please upload a video file first.")
+                else:
+                    st.session_state.running = True
+            if stop_button:
+                st.session_state.running = False
+
+            # Layout Columns
+            col1, col2 = st.columns([2.2, 1.0])
+
+            with col1:
+                st.subheader("Live Detection Stream")
+                frame_slot = st.empty()
+
+            with col2:
+                st.subheader("Live Status & KPIs")
+                fps_metric = st.metric("Processing FPS", "0.0")
+                active_violations_box = st.empty()
+                last_alert_box = st.empty()
+
+            if st.session_state.running and video_source is not None:
+                if not MODEL_PATH.exists():
+                    st.error(f"❌ Model file not found at '{MODEL_PATH}'. Please ensure 'model/best.pt' exists.")
                     st.session_state.running = False
                 else:
-                    try:
-                        while st.session_state.running:
-                            ret, frame = cap.read()
-                            if not ret:
-                                st.info("End of video stream reached.")
-                                break
+                    detector = get_detector(str(MODEL_PATH))
+                    detector.conf_thresh = conf_thresh
+                    cap = open_video_capture(video_source)
 
-                            annotated, detections, fps = detector.run_on_frame(frame)
-                            fps_metric.metric("Processing FPS", f"{fps:.1f}")
+                    if cap is None or not cap.isOpened():
+                        st.error(f"❌ Failed to open video source '{video_source}'. Please verify file format or stream URL.")
+                        st.session_state.running = False
+                    else:
+                        try:
+                            while st.session_state.running:
+                                ret, frame = cap.read()
+                                if not ret:
+                                    st.info("End of video stream reached.")
+                                    break
 
-                            # Render Frame
-                            annotated_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
-                            frame_slot.image(annotated_rgb, channels="RGB", use_container_width=True)
+                                annotated, detections, fps = detector.run_on_frame(frame)
+                                fps_metric.metric("Processing FPS", f"{fps:.1f}")
 
-                            # Evaluate Safety Rules
-                            violations = apply_rules(detections)
-                            now_time = time.time()
+                                # Render Frame
+                                annotated_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
+                                frame_slot.image(annotated_rgb, channels="RGB", use_container_width=True)
 
-                            if violations:
-                                active_violations_box.error(f"⚠️ Active Violations: {', '.join(violations)}")
-                                ts_str = datetime.now().isoformat()
+                                # Evaluate Safety Rules
+                                violations = apply_rules(detections)
+                                now_time = time.time()
 
-                                if (now_time - st.session_state.last_log_time) >= log_cooldown:
-                                    st.session_state.last_log_time = now_time
+                                if violations:
+                                    active_violations_box.error(f"⚠️ Active Violations: {', '.join(violations)}")
+                                    ts_str = datetime.now().isoformat()
 
-                                    img_filename = f"violation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
-                                    img_path = VIDEO_DIR / img_filename
-                                    cv2.imwrite(str(img_path), annotated)
+                                    if (now_time - st.session_state.last_log_time) >= log_cooldown:
+                                        st.session_state.last_log_time = now_time
 
-                                    max_conf = max((d["confidence"] for d in detections), default=0.0)
+                                        img_filename = f"violation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+                                        img_path = VIDEO_DIR / img_filename
+                                        cv2.imwrite(str(img_path), annotated)
 
-                                    # Log each individual violation for detailed analytics/charts
-                                    for v in violations:
-                                        record = {
-                                            "id": f"{ts_str}_{v.replace(' ', '_')}",
-                                            "timestamp": ts_str,
-                                            "frame_image": img_filename,
-                                            "violation_type": v,
+                                        max_conf = max((d["confidence"] for d in detections), default=0.0)
+
+                                        # Log each individual violation for detailed analytics/charts
+                                        for v in violations:
+                                            record = {
+                                                "id": f"{ts_str}_{v.replace(' ', '_')}",
+                                                "timestamp": ts_str,
+                                                "frame_image": img_filename,
+                                                "violation_type": v,
+                                                "confidence": max_conf,
+                                                "worker_id": "Worker-01",
+                                                "source": str(video_source),
+                                            }
+                                            with open(LOG_PATH, "a", encoding="utf-8") as lf:
+                                                lf.write(json.dumps(record) + "\n")
+
+                                        # Send ONE combined email alert with all detected violations
+                                        consolidated_alert = {
+                                            "id": ts_str,
+                                            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                            "frame_image": str(img_path),
+                                            "violations": violations,
                                             "confidence": max_conf,
                                             "worker_id": "Worker-01",
                                             "source": str(video_source),
                                         }
-                                        with open(LOG_PATH, "a", encoding="utf-8") as lf:
-                                            lf.write(json.dumps(record) + "\n")
+                                        trigger_alert_async(consolidated_alert)
+                                        last_alert_box.warning(f"🚨 Logged Alert: {', '.join(violations)} at {datetime.now().strftime('%H:%M:%S')}")
+                                else:
+                                    active_violations_box.success("✅ All Workers Compliant")
 
-                                    # Send ONE combined email alert with all detected violations
-                                    consolidated_alert = {
-                                        "id": ts_str,
-                                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                        "frame_image": str(img_path),
-                                        "violations": violations,
-                                        "confidence": max_conf,
-                                        "worker_id": "Worker-01",
-                                        "source": str(video_source),
-                                    }
-                                    trigger_alert_async(consolidated_alert)
-                                    last_alert_box.warning(f"🚨 Logged Alert: {', '.join(violations)} at {datetime.now().strftime('%H:%M:%S')}")
-                            else:
-                                active_violations_box.success("✅ All Workers Compliant")
-
-                            time.sleep(0.01)
-                    finally:
-                        cap.release()
-                        st.session_state.running = False
-        else:
-            frame_slot.info("💡 Select your stream configuration in the sidebar and click **Start Stream**.")
+                                time.sleep(0.01)
+                        finally:
+                            cap.release()
+                            st.session_state.running = False
+            else:
+                frame_slot.info("💡 Select your stream configuration in the sidebar and click **Start Stream**.")
 
         # Recent Logs Summary Table below
         st.markdown("---")
